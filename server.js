@@ -54,12 +54,15 @@ async function cacheSet(key, val, ttlSec = 120) {
 }
 
 // ── Helper PostgREST (Solo Lectura GET) ──
-async function dbGet(table, queryStr) {
+async function dbGet(table, queryStr, userAuthHeader = '') {
   const url = `${INSFORGE_URL}/api/database/records/${table}?${queryStr}`;
+  const bearer = userAuthHeader && userAuthHeader.startsWith('Bearer ')
+    ? userAuthHeader
+    : `Bearer ${INSFORGE_KEY}`;
   const res = await fetch(url, {
     headers: {
       apikey: INSFORGE_KEY,
-      Authorization: `Bearer ${INSFORGE_KEY}`,
+      Authorization: bearer,
       'Accept-Profile': SCHEMA,
     },
   });
@@ -170,7 +173,7 @@ Responde ÚNICAMENTE con JSON válido.`;
 }
 
 // ── Ejecución Segura Aislada por idempresa ──
-async function executePlan(plan, { idempresa, allowedModules }) {
+async function executePlan(plan, { idempresa, allowedModules, authHeader = '' }) {
   const limit = Math.min(20, Math.max(5, Number(plan.limit) || 10));
 
   switch (plan.intent) {
@@ -181,7 +184,8 @@ async function executePlan(plan, { idempresa, allowedModules }) {
       const { from, to } = normalizeDateBounds(plan.date_from, plan.date_to);
       const invoices = await dbGet(
         'facturascli',
-        `select=idfactura,codigo,fecha,total&idempresa=eq.${idempresa}&fecha=gte.${from}&fecha=lte.${to}&limit=200`
+        `select=idfactura,codigo,fecha,total&idempresa=eq.${idempresa}&fecha=gte.${from}&fecha=lte.${to}&limit=200`,
+        authHeader
       );
       if (!invoices.length) {
         return { rows: [], columns: [], meta: { from, to, invoicesCount: 0 } };
@@ -189,7 +193,8 @@ async function executePlan(plan, { idempresa, allowedModules }) {
       const ids = invoices.map((i) => i.idfactura).join(',');
       const lines = await dbGet(
         'lineasfacturascli',
-        `select=referencia,descripcion,cantidad,pvptotal&idfactura=in.(${ids})&limit=1000`
+        `select=referencia,descripcion,cantidad,pvptotal&idfactura=in.(${ids})&limit=1000`,
+        authHeader
       );
       const agg = new Map();
       for (const l of lines) {
@@ -221,7 +226,8 @@ async function executePlan(plan, { idempresa, allowedModules }) {
       const { from, to } = normalizeDateBounds(plan.date_from, plan.date_to);
       const invoices = await dbGet(
         'facturascli',
-        `select=idfactura,codigo,nombrecliente,fecha,total,totaliva,pagada&idempresa=eq.${idempresa}&fecha=gte.${from}&fecha=lte.${to}&order=idfactura.desc&limit=200`
+        `select=idfactura,codigo,nombrecliente,fecha,total,totaliva,pagada&idempresa=eq.${idempresa}&fecha=gte.${from}&fecha=lte.${to}&order=idfactura.desc&limit=200`,
+        authHeader
       );
       const total = invoices.reduce((s, f) => s + Number(f.total || 0), 0);
       const cobrado = invoices.filter((f) => f.pagada).reduce((s, f) => s + Number(f.total || 0), 0);
@@ -240,7 +246,7 @@ async function executePlan(plan, { idempresa, allowedModules }) {
       }
       let q = `select=codigo,nombrecliente,fecha,total&idempresa=eq.${idempresa}&pagada=not.is.true&order=idfactura.desc&limit=${limit}`;
       if (plan.search) q += `&nombrecliente=ilike.*${encodeURIComponent(plan.search)}*`;
-      const rows = await dbGet('facturascli', q);
+      const rows = await dbGet('facturascli', q, authHeader);
       const totalPendiente = rows.reduce((s, r) => s + Number(r.total || 0), 0);
       return { rows, columns: ['codigo', 'nombrecliente', 'fecha', 'total'], meta: { count: rows.length, totalPendiente } };
     }
@@ -251,7 +257,7 @@ async function executePlan(plan, { idempresa, allowedModules }) {
       }
       let q = `select=referencia,descripcion,precio,stockfis&idempresa=eq.${idempresa}&order=stockfis.asc&limit=${limit}`;
       if (plan.search) q += `&descripcion=ilike.*${encodeURIComponent(plan.search)}*`;
-      let rows = await dbGet('productos', q);
+      let rows = await dbGet('productos', q, authHeader);
       if (plan.low_only) {
         rows = rows.filter((r) => Number(r.stockfis || 0) <= 5);
       }
@@ -264,7 +270,7 @@ async function executePlan(plan, { idempresa, allowedModules }) {
       }
       let q = `select=codcliente,nombre,cifnif,telefono1,email&idempresa=eq.${idempresa}&order=nombre.asc&limit=${limit}`;
       if (plan.search) q += `&nombre=ilike.*${encodeURIComponent(plan.search)}*`;
-      const rows = await dbGet('clientes', q);
+      const rows = await dbGet('clientes', q, authHeader);
       return { rows, columns: ['nombre', 'cifnif', 'telefono1', 'email'], meta: { count: rows.length } };
     }
 
@@ -275,7 +281,8 @@ async function executePlan(plan, { idempresa, allowedModules }) {
       const { from, to } = normalizeDateBounds(plan.date_from, plan.date_to);
       const rows = await dbGet(
         'gastos',
-        `select=concepto,proveedor,fecha,total&idempresa=eq.${idempresa}&fecha=gte.${from}&fecha=lte.${to}&order=idgasto.desc&limit=${limit}`
+        `select=concepto,proveedor,fecha,total&idempresa=eq.${idempresa}&fecha=gte.${from}&fecha=lte.${to}&order=idgasto.desc&limit=${limit}`,
+        authHeader
       );
       const totalGastos = rows.reduce((s, r) => s + Number(r.total || 0), 0);
       return { rows, columns: ['concepto', 'proveedor', 'fecha', 'total'], meta: { from, to, totalGastos } };
@@ -285,13 +292,14 @@ async function executePlan(plan, { idempresa, allowedModules }) {
       const { from, to } = normalizeDateBounds(plan.date_from, plan.date_to);
       const rows = await dbGet(
         'reservas',
-        `select=cliente_nombre,servicio,fecha,hora,estado&idempresa=eq.${idempresa}&fecha=gte.${from}&fecha=lte.${to}&order=fecha.asc&limit=${limit}`
+        `select=cliente_nombre,servicio,fecha,hora,estado&idempresa=eq.${idempresa}&fecha=gte.${from}&fecha=lte.${to}&order=fecha.asc&limit=${limit}`,
+        authHeader
       );
       return { rows, columns: ['cliente_nombre', 'servicio', 'fecha', 'hora', 'estado'], meta: { from, to } };
     }
 
     default: {
-      const faqs = await dbGet('faq_documentacion', 'select=titulo,contenido,modulo&activo=eq.true&limit=12');
+      const faqs = await dbGet('faq_documentacion', 'select=titulo,contenido,modulo&activo=eq.true&limit=12', authHeader);
       return { rows: faqs, columns: ['titulo', 'modulo'], meta: { faqMode: true } };
     }
   }
@@ -328,7 +336,8 @@ app.post('/api/ai/query', async (req, res) => {
     }
 
     const plan = await extractQueryPlan(question, companyName);
-    const result = await executePlan(plan, { idempresa, allowedModules });
+    const authHeader = req.headers.authorization || '';
+    const result = await executePlan(plan, { idempresa, allowedModules, authHeader });
 
     if (result.denied) {
       return res.json({
