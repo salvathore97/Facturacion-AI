@@ -122,8 +122,22 @@ function cleanSearch(val, companyName = '') {
   return s;
 }
 
-// ── Planificador de Consultas (Reglas Rápidas + Few-Shot Ollama) ──
-async function extractQueryPlan(question, companyName = '') {
+async function loadActiveSkills(idempresa, authHeader = '') {
+  const cacheKey = `ai:skills:${idempresa}`;
+  const cached = await cacheGet(cacheKey);
+  if (cached) return cached;
+  try {
+    const all = await dbGet('ia_skills', `select=titulo,instruccion,ejemplo_pregunta,intent,idempresa&activo=eq.true`, authHeader);
+    const filtered = (all || []).filter((s) => s.idempresa === null || String(s.idempresa) === String(idempresa));
+    await cacheSet(cacheKey, filtered, 60);
+    return filtered;
+  } catch {
+    return [];
+  }
+}
+
+// ── Planificador de Consultas (Reglas Rápidas + Few-Shot Ollama + Skills) ──
+async function extractQueryPlan(question, companyName = '', skills = []) {
   const today = new Date().toISOString().slice(0, 10);
   const qLower = question.toLowerCase().trim();
 
@@ -160,6 +174,7 @@ Ejemplos entrenados:
 - "Stock de pintura" -> {"intent":"stock_status","date_from":null,"date_to":null,"search":"pintura","low_only":false,"limit":15}
 Reglas:
 - Si no piden filtrar por un nombre específico de cliente o producto, DEBES poner "search": null (nunca pongas la palabra "null" entre comillas ni el nombre de la empresa).
+${skills.length > 0 ? `\nSkills entrenadas:\n${skills.map((s) => `- [${s.intent}] ${s.titulo}: ${s.instruccion}${s.ejemplo_pregunta ? ` (Ej: "${s.ejemplo_pregunta}")` : ''}`).join('\n')}` : ''}
 Responde ÚNICAMENTE con JSON válido.`;
 
   const raw = await ollamaGenerate(question, { system, format: 'json' });
@@ -324,9 +339,20 @@ app.get('/api/ai/health', async (_req, res) => {
 app.post('/api/ai/query', async (req, res) => {
   const started = Date.now();
   try {
-    const { question, idempresa, allowedModules = [], companyName = 'Tu Empresa' } = req.body || {};
+    const { question, idempresa, allowedModules = [], companyName = 'Tu Empresa', bypassEnabledCheck = false } = req.body || {};
     if (!question || !idempresa) {
       return res.status(400).json({ ok: false, error: 'Se requiere question e idempresa' });
+    }
+
+    const authHeader = req.headers.authorization || '';
+
+    if (!bypassEnabledCheck) {
+      try {
+        const empRows = await dbGet('empresas', `select=ia_habilitada&idempresa=eq.${idempresa}&limit=1`, authHeader);
+        if (empRows?.[0] && !empRows[0].ia_habilitada) {
+          return res.status(403).json({ ok: false, error: 'El módulo de IA no está habilitado para esta empresa.' });
+        }
+      } catch {}
     }
 
     const cacheKey = `ai:q:${idempresa}:${question.trim().toLowerCase()}`;
@@ -335,8 +361,8 @@ app.post('/api/ai/query', async (req, res) => {
       return res.json({ ...cached, cached: true, latencyMs: Date.now() - started });
     }
 
-    const plan = await extractQueryPlan(question, companyName);
-    const authHeader = req.headers.authorization || '';
+    const skills = await loadActiveSkills(idempresa, authHeader);
+    const plan = await extractQueryPlan(question, companyName, skills);
     const result = await executePlan(plan, { idempresa, allowedModules, authHeader });
 
     if (result.denied) {
@@ -351,10 +377,14 @@ app.post('/api/ai/query', async (req, res) => {
       });
     }
 
+    const skillsContext = skills.length > 0
+      ? `\nReglas y Skills del negocio:\n${skills.map((s) => `- ${s.titulo}: ${s.instruccion}`).join('\n')}`
+      : '';
+
     const synthesisPrompt = `Empresa: ${companyName}
 Pregunta del usuario: "${question}"
 Intención detectada: ${plan.intent}
-Metadatos: ${JSON.stringify(result.meta || {})}
+Metadatos: ${JSON.stringify(result.meta || {})}${skillsContext}
 Datos reales de la base de datos (${result.rows.length} registros):
 ${JSON.stringify(result.rows.slice(0, 12))}
 
