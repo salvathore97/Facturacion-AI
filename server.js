@@ -107,37 +107,65 @@ function hasModule(allowedModules, mod) {
   return allowedModules.includes('*') || allowedModules.includes(mod);
 }
 
-// ── Planificador de Consultas (Intent Extraction) ──
-async function extractQueryPlan(question) {
+function cleanSearch(val, companyName = '') {
+  if (val === null || val === undefined) return null;
+  const s = String(val).trim();
+  if (!s) return null;
+  const lower = s.toLowerCase();
+  if (['null', 'none', 'undefined', 'n/a', 'todos', 'todas', 'all', 'ninguno', 'pendientes', 'cobro', 'stock', 'inventario'].includes(lower)) {
+    return null;
+  }
+  if (companyName && lower === companyName.toLowerCase()) return null;
+  return s;
+}
+
+// ── Planificador de Consultas (Reglas Rápidas + Few-Shot Ollama) ──
+async function extractQueryPlan(question, companyName = '') {
   const today = new Date().toISOString().slice(0, 10);
+  const qLower = question.toLowerCase().trim();
+
+  // Atajos deterministas (0ms, 100% precisos para consultas frecuentes)
+  if (/pendiente.*cobro|cuentas por cobrar|por cobrar|deben|adeudan/.test(qLower) && !/cliente\s+\w+/.test(qLower)) {
+    return { intent: 'unpaid_invoices', search: null, limit: 20 };
+  }
+  if (/stock bajo|bajo stock|poco stock|agotad/.test(qLower)) {
+    return { intent: 'stock_status', low_only: true, search: null, limit: 20 };
+  }
+  if (/resumen de ventas de este mes|ventas del mes|facturacion del mes|facturación del mes/.test(qLower)) {
+    const firstOfMonth = `${today.slice(0, 7)}-01`;
+    return { intent: 'sales_summary', date_from: firstOfMonth, date_to: today, limit: 20 };
+  }
+  if (/m[aá]s.*vendi[oó].*hoy|vendi[oó].*m[aá]s.*hoy/.test(qLower)) {
+    return { intent: 'top_products_sold', date_from: today, date_to: today, limit: 10 };
+  }
+
   const system = `Eres un planificador de consultas de solo lectura para un ERP multi-empresa en República Dominicana.
 Fecha actual: ${today}.
 Convierte la pregunta del usuario en UN objeto JSON estricto con esta estructura:
 {
   "intent": "top_products_sold" | "sales_summary" | "unpaid_invoices" | "stock_status" | "clients_summary" | "expenses_summary" | "bookings_summary" | "general_help",
-  "date_from": "YYYY-MM-DD o null",
-  "date_to": "YYYY-MM-DD o null",
-  "search": "texto o null",
-  "low_only": boolean,
-  "limit": numero entre 5 y 20
+  "date_from": null,
+  "date_to": null,
+  "search": null,
+  "low_only": false,
+  "limit": 10
 }
+Ejemplos entrenados:
+- "Facturas pendientes de cobro" -> {"intent":"unpaid_invoices","date_from":null,"date_to":null,"search":null,"low_only":false,"limit":20}
+- "Qué producto se vendió más el martes 13 de agosto" -> {"intent":"top_products_sold","date_from":"${today.slice(0, 4)}-08-13","date_to":"${today.slice(0, 4)}-08-13","search":null,"low_only":false,"limit":10}
+- "Cuánto se vendió ayer" -> {"intent":"sales_summary","date_from":"AYER","date_to":"AYER","search":null,"low_only":false,"limit":10}
+- "Stock de pintura" -> {"intent":"stock_status","date_from":null,"date_to":null,"search":"pintura","low_only":false,"limit":15}
 Reglas:
-- Si pregunta qué producto/stock/artículo se vendió más en una fecha o rango -> intent: "top_products_sold".
-- Si dice "martes 13 de agosto" sin año, usa el año actual (${today.slice(0, 4)}).
-- Si pregunta cuánto se vendió / facturación / ingresos -> intent: "sales_summary".
-- Si pregunta cuentas por cobrar / facturas pendientes / quién debe -> intent: "unpaid_invoices".
-- Si pregunta inventario / stock disponible / productos bajos de stock -> intent: "stock_status".
-- Si pregunta clientes -> intent: "clients_summary".
-- Si pregunta gastos -> intent: "expenses_summary".
-- Si pregunta citas o reservas -> intent: "bookings_summary".
-- Si pregunta cómo usar el sistema -> intent: "general_help".
+- Si no piden filtrar por un nombre específico de cliente o producto, DEBES poner "search": null (nunca pongas la palabra "null" entre comillas ni el nombre de la empresa).
 Responde ÚNICAMENTE con JSON válido.`;
 
   const raw = await ollamaGenerate(question, { system, format: 'json' });
   try {
-    return JSON.parse(raw);
+    const parsed = JSON.parse(raw);
+    parsed.search = cleanSearch(parsed.search, companyName);
+    return parsed;
   } catch {
-    return { intent: 'general_help', limit: 10 };
+    return { intent: 'general_help', search: null, limit: 10 };
   }
 }
 
@@ -210,11 +238,11 @@ async function executePlan(plan, { idempresa, allowedModules }) {
       if (!hasModule(allowedModules, 'ventas')) {
         return { denied: true, reason: 'No tienes permiso para consultar cuentas por cobrar.' };
       }
-      let q = `select=codigo,nombrecliente,fecha,total&idempresa=eq.${idempresa}&pagada=eq.false&order=idfactura.desc&limit=${limit}`;
+      let q = `select=codigo,nombrecliente,fecha,total&idempresa=eq.${idempresa}&pagada=not.is.true&order=idfactura.desc&limit=${limit}`;
       if (plan.search) q += `&nombrecliente=ilike.*${encodeURIComponent(plan.search)}*`;
       const rows = await dbGet('facturascli', q);
       const totalPendiente = rows.reduce((s, r) => s + Number(r.total || 0), 0);
-      return { rows, columns: ['codigo', 'nombrecliente', 'fecha', 'total'], meta: { totalPendiente } };
+      return { rows, columns: ['codigo', 'nombrecliente', 'fecha', 'total'], meta: { count: rows.length, totalPendiente } };
     }
 
     case 'stock_status': {
@@ -299,7 +327,7 @@ app.post('/api/ai/query', async (req, res) => {
       return res.json({ ...cached, cached: true, latencyMs: Date.now() - started });
     }
 
-    const plan = await extractQueryPlan(question);
+    const plan = await extractQueryPlan(question, companyName);
     const result = await executePlan(plan, { idempresa, allowedModules });
 
     if (result.denied) {
