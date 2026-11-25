@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import Redis from 'ioredis';
+import { registerBackupRunner } from './backupRunner.js';
 
 dotenv.config({ path: '.env.local' });
 dotenv.config();
@@ -412,6 +413,28 @@ Redacta una respuesta ejecutiva, breve y clara en español usando ÚNICAMENTE es
     return res.status(500).json({ ok: false, error: err.message });
   }
 });
+
+async function insforgeFetch(pathWithQuery, opts = {}) {
+  const method = (opts.method || 'GET').toUpperCase();
+  const res = await fetch(`${INSFORGE_URL}/api/database/records/${pathWithQuery}`, {
+    ...opts,
+    headers: {
+      apikey: INSFORGE_KEY,
+      Authorization: `Bearer ${INSFORGE_KEY}`,
+      'Accept-Profile': SCHEMA,
+      ...(method !== 'GET' ? { 'Content-Profile': SCHEMA, 'Content-Type': 'application/json' } : {}),
+      ...(opts.headers || {}),
+    },
+  });
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`PostgREST ${method} ${pathWithQuery} -> ${res.status}: ${txt.slice(0, 160)}`);
+  }
+  const text = await res.text();
+  return text ? JSON.parse(text) : null;
+}
+
+registerBackupRunner(app, insforgeFetch);
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Salvathore AI Bridge corriendo en http://0.0.0.0:${PORT} -> Ollama ${OLLAMA_URL} (${OLLAMA_MODEL})`);
