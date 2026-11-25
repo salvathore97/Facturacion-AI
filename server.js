@@ -55,14 +55,16 @@ async function cacheSet(key, val, ttlSec = 120) {
 }
 
 // ── Helper PostgREST (Solo Lectura GET) ──
-async function dbGet(table, queryStr, userAuthHeader = '') {
+async function dbGet(table, queryStr, userAuthHeader = '', { requireUserJwt = false } = {}) {
   const url = `${INSFORGE_URL}/api/database/records/${table}?${queryStr}`;
-  const bearer = userAuthHeader && userAuthHeader.startsWith('Bearer ')
-    ? userAuthHeader
-    : `Bearer ${INSFORGE_KEY}`;
+  const hasUserJwt = userAuthHeader && userAuthHeader.startsWith('Bearer ');
+  if (requireUserJwt && !hasUserJwt) {
+    throw new Error('Se requiere autenticación (Bearer token).');
+  }
+  const bearer = hasUserJwt ? userAuthHeader : `Bearer ${INSFORGE_KEY}`;
   const res = await fetch(url, {
     headers: {
-      apikey: INSFORGE_KEY,
+      apikey: hasUserJwt ? (process.env.VITE_INSFORGE_ANON_KEY || INSFORGE_KEY) : INSFORGE_KEY,
       Authorization: bearer,
       'Accept-Profile': SCHEMA,
     },
@@ -72,6 +74,28 @@ async function dbGet(table, queryStr, userAuthHeader = '') {
     throw new Error(`PostgREST ${table} ${res.status}: ${txt.slice(0, 160)}`);
   }
   return res.json();
+}
+
+async function verifyJwtProfile(authHeader) {
+  if (!authHeader || !authHeader.startsWith('Bearer ')) return null;
+  try {
+    const rows = await dbGet('profiles', 'select=id,idempresa,is_superadmin&limit=1', authHeader, { requireUserJwt: true });
+    return Array.isArray(rows) && rows.length > 0 ? rows[0] : null;
+  } catch {
+    return null;
+  }
+}
+
+async function requireSuperAdminOrSecret(req, res, next) {
+  const secret = req.headers['x-backup-secret'] || '';
+  if (INSFORGE_KEY && secret === INSFORGE_KEY) return next();
+
+  const profile = await verifyJwtProfile(req.headers.authorization || '');
+  if (!profile || !profile.is_superadmin) {
+    return res.status(401).json({ ok: false, error: 'Acceso restringido a Super Admin o clave interna.' });
+  }
+  req.authProfile = profile;
+  return next();
 }
 
 // ── Helper Ollama ──
@@ -346,10 +370,29 @@ app.post('/api/ai/query', async (req, res) => {
     }
 
     const authHeader = req.headers.authorization || '';
+    const userProfile = await verifyJwtProfile(authHeader);
+    if (!userProfile) {
+      return res.status(401).json({ ok: false, error: 'Sesión inválida o expirada. Inicia sesión nuevamente.' });
+    }
 
-    if (!bypassEnabledCheck) {
+    const targetEmpresaId = Number(idempresa);
+    if (!userProfile.is_superadmin && Number(userProfile.idempresa) !== targetEmpresaId) {
+      // Verificar si tiene permiso explícito multi-empresa en empresa_usuario_permisos
+      const perms = await dbGet(
+        'empresa_usuario_permisos',
+        `select=id&idempresa=eq.${targetEmpresaId}&limit=1`,
+        authHeader,
+        { requireUserJwt: true }
+      ).catch(() => []);
+      if (!Array.isArray(perms) || perms.length === 0) {
+        return res.status(403).json({ ok: false, error: 'No tienes acceso a esta empresa.' });
+      }
+    }
+
+    const effectiveBypass = Boolean(bypassEnabledCheck && userProfile.is_superadmin);
+    if (!effectiveBypass) {
       try {
-        const empRows = await dbGet('empresas', `select=ia_habilitada&idempresa=eq.${idempresa}&limit=1`, authHeader);
+        const empRows = await dbGet('empresas', `select=ia_habilitada&idempresa=eq.${targetEmpresaId}&limit=1`, authHeader, { requireUserJwt: true });
         if (empRows?.[0] && !empRows[0].ia_habilitada) {
           return res.status(403).json({ ok: false, error: 'El módulo de IA no está habilitado para esta empresa.' });
         }
@@ -434,7 +477,7 @@ async function insforgeFetch(pathWithQuery, opts = {}) {
   return text ? JSON.parse(text) : null;
 }
 
-registerBackupRunner(app, insforgeFetch);
+registerBackupRunner(app, insforgeFetch, requireSuperAdminOrSecret);
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Salvathore AI Bridge corriendo en http://0.0.0.0:${PORT} -> Ollama ${OLLAMA_URL} (${OLLAMA_MODEL})`);

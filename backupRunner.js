@@ -173,7 +173,7 @@ async function uploadJsonToDrive(accessToken, fileName, jsonString, folderName, 
   return data;
 }
 
-export function registerBackupRunner(app, insforgeFetch) {
+export function registerBackupRunner(app, insforgeFetch, authMiddleware = (_req, _res, next) => next()) {
   const state = {
     running: false,
     lastRunAt: null,
@@ -340,7 +340,7 @@ export function registerBackupRunner(app, insforgeFetch) {
     }
   }, 60 * 1000);
 
-  app.get('/api/backups/status', async (_req, res) => {
+  app.get('/api/backups/status', authMiddleware, async (_req, res) => {
     const gCfg = await resolveGoogleServerConfig();
     res.json({
       ok: true,
@@ -358,7 +358,7 @@ export function registerBackupRunner(app, insforgeFetch) {
     });
   });
 
-  app.post('/api/backups/schedule-test', (req, res) => {
+  app.post('/api/backups/schedule-test', authMiddleware, (req, res) => {
     const delayMinutes = Math.max(1, Math.min(60, Number(req.body?.delayMinutes || 5)));
     const idempresa = req.body?.idempresa || null;
     if (testTimer) clearTimeout(testTimer);
@@ -383,7 +383,7 @@ export function registerBackupRunner(app, insforgeFetch) {
     });
   });
 
-  app.post('/api/backups/google-exchange', async (req, res) => {
+  app.post('/api/backups/google-exchange', authMiddleware, async (req, res) => {
     try {
       const code = (req.body?.code || '').trim();
       if (!code) return res.status(400).json({ ok: false, error: 'Falta code de autorización de Google' });
@@ -433,7 +433,7 @@ export function registerBackupRunner(app, insforgeFetch) {
     }
   });
 
-  app.post('/api/backups/run', async (req, res) => {
+  app.post('/api/backups/run', authMiddleware, async (req, res) => {
     try {
       const result = await runBackups({
         idempresa: req.body?.idempresa || null,
