@@ -182,6 +182,23 @@ export function registerBackupRunner(app, insforgeFetch) {
     cronHourRd: Number(process.env.BACKUP_CRON_HOUR ?? 2) // 02:00 AM Santo Domingo
   };
 
+  async function resolveGoogleServerConfig() {
+    const cfg = getGoogleServerConfig();
+    if (!cfg.refreshToken) {
+      try {
+        const rows = await insforgeFetch('admin_integraciones?servicio=eq.google_drive_server&select=activo,config&limit=1');
+        const row = Array.isArray(rows) ? rows[0] : null;
+        if (row?.activo && row?.config?.refresh_token) {
+          cfg.refreshToken = row.config.refresh_token;
+          cfg.hasRefreshToken = Boolean(cfg.clientId && cfg.clientSecret && cfg.refreshToken);
+        }
+      } catch {
+        // ignorar si aún no existe registro
+      }
+    }
+    return cfg;
+  }
+
   async function runBackups({ idempresa = null, trigger = 'cron' } = {}) {
     if (state.running) return { ok: false, error: 'Ya hay un respaldo en ejecución' };
     state.running = true;
@@ -193,7 +210,7 @@ export function registerBackupRunner(app, insforgeFetch) {
         return { ok: true, processed: 0, results: [] };
       }
 
-      const gCfg = getGoogleServerConfig();
+      const gCfg = await resolveGoogleServerConfig();
       let driveToken = null;
       let driveAuthError = null;
       if (gCfg.hasServiceAccount || gCfg.hasRefreshToken) {
@@ -321,8 +338,8 @@ export function registerBackupRunner(app, insforgeFetch) {
     }
   }, 60 * 1000);
 
-  app.get('/api/backups/status', (_req, res) => {
-    const gCfg = getGoogleServerConfig();
+  app.get('/api/backups/status', async (_req, res) => {
+    const gCfg = await resolveGoogleServerConfig();
     res.json({
       ok: true,
       running: state.running,
@@ -336,6 +353,56 @@ export function registerBackupRunner(app, insforgeFetch) {
         : 'insforge_only',
       lastSummary: state.lastSummary
     });
+  });
+
+  app.post('/api/backups/google-exchange', async (req, res) => {
+    try {
+      const code = (req.body?.code || '').trim();
+      if (!code) return res.status(400).json({ ok: false, error: 'Falta code de autorización de Google' });
+
+      const gCfg = getGoogleServerConfig();
+      if (!gCfg.clientId || !gCfg.clientSecret) {
+        return res.status(500).json({ ok: false, error: 'Faltan GOOGLE_CLIENT_ID o GOOGLE_CLIENT_SECRET en el servidor' });
+      }
+
+      const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          code,
+          client_id: gCfg.clientId,
+          client_secret: gCfg.clientSecret,
+          redirect_uri: 'postmessage',
+          grant_type: 'authorization_code'
+        })
+      });
+      const tokenData = await tokenRes.json();
+      if (!tokenRes.ok || !tokenData.refresh_token) {
+        return res.status(400).json({
+          ok: false,
+          error: tokenData.error_description || tokenData.error || 'Google no devolvió refresh_token (intenta de nuevo aceptando el acceso offline).'
+        });
+      }
+
+      await insforgeFetch('admin_integraciones?on_conflict=servicio', {
+        method: 'POST',
+        headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
+        body: JSON.stringify([{
+          servicio: 'google_drive_server',
+          nombre: 'Google Drive Cron 24/7',
+          tipo: 'cloud_storage',
+          activo: true,
+          config: {
+            refresh_token: tokenData.refresh_token,
+            updated_at: new Date().toISOString()
+          }
+        }])
+      });
+
+      res.json({ ok: true, connected: true, googleDriveMode: 'oauth_refresh_token' });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message });
+    }
   });
 
   app.post('/api/backups/run', async (req, res) => {
