@@ -179,8 +179,10 @@ export function registerBackupRunner(app, insforgeFetch) {
     lastRunAt: null,
     lastRunDateRd: null,
     lastSummary: null,
+    scheduledTestAt: null,
     cronHourRd: Number(process.env.BACKUP_CRON_HOUR ?? 2) // 02:00 AM Santo Domingo
   };
+  let testTimer = null;
 
   async function resolveGoogleServerConfig() {
     const cfg = getGoogleServerConfig();
@@ -346,12 +348,38 @@ export function registerBackupRunner(app, insforgeFetch) {
       cronHourRd: state.cronHourRd,
       lastRunAt: state.lastRunAt,
       lastRunDateRd: state.lastRunDateRd,
+      scheduledTestAt: state.scheduledTestAt,
       googleDriveMode: gCfg.hasServiceAccount
         ? 'service_account'
         : gCfg.hasRefreshToken
         ? 'oauth_refresh_token'
         : 'insforge_only',
       lastSummary: state.lastSummary
+    });
+  });
+
+  app.post('/api/backups/schedule-test', (req, res) => {
+    const delayMinutes = Math.max(1, Math.min(60, Number(req.body?.delayMinutes || 5)));
+    const idempresa = req.body?.idempresa || null;
+    if (testTimer) clearTimeout(testTimer);
+
+    const runAt = new Date(Date.now() + delayMinutes * 60 * 1000).toISOString();
+    state.scheduledTestAt = runAt;
+
+    testTimer = setTimeout(() => {
+      state.scheduledTestAt = null;
+      testTimer = null;
+      console.log(`[BackupCron] Ejecutando prueba programada (${delayMinutes} min)...`);
+      runBackups({ idempresa, trigger: `scheduled_test_${delayMinutes}m` })
+        .then((r) => console.log(`[BackupCron] Prueba finalizada: ${r.processed || 0} empresa(s)`))
+        .catch((e) => console.error('[BackupCron] Error en prueba:', e.message));
+    }, delayMinutes * 60 * 1000);
+
+    res.json({
+      ok: true,
+      delayMinutes,
+      scheduledTestAt: runAt,
+      idempresa: idempresa || 'todas'
     });
   });
 
