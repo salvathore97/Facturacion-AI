@@ -79,7 +79,16 @@ async function dbGet(table, queryStr, userAuthHeader = '', { requireUserJwt = fa
 async function verifyJwtProfile(authHeader) {
   if (!authHeader || !authHeader.startsWith('Bearer ')) return null;
   try {
-    const rows = await dbGet('profiles', 'select=id,idempresa,is_superadmin&limit=1', authHeader, { requireUserJwt: true });
+    const token = authHeader.slice(7).trim();
+    const parts = token.split('.');
+    let subFilter = '';
+    if (parts.length >= 2) {
+      const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+      if (payload?.sub) {
+        subFilter = `&id=eq.${encodeURIComponent(payload.sub)}`;
+      }
+    }
+    const rows = await dbGet('profiles', `select=id,idempresa,is_superadmin${subFilter}&limit=1`, authHeader, { requireUserJwt: true });
     return Array.isArray(rows) && rows.length > 0 ? rows[0] : null;
   } catch {
     return null;
