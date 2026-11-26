@@ -23,9 +23,19 @@ const memCache = new Map();
 let redisClient = null;
 if (process.env.REDIS_URL) {
   try {
-    redisClient = new Redis(process.env.REDIS_URL, { maxRetriesPerRequest: 1, lazyConnect: true });
-    redisClient.connect().catch(() => {
+    const client = new Redis(process.env.REDIS_URL, {
+      maxRetriesPerRequest: 1,
+      lazyConnect: true,
+      retryStrategy: () => null,
+    });
+    client.on('error', () => {
       redisClient = null;
+    });
+    client.connect().then(() => {
+      redisClient = client;
+    }).catch(() => {
+      redisClient = null;
+      client.disconnect();
     });
   } catch {
     redisClient = null;
